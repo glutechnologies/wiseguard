@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -69,8 +70,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   wiseguard [--config FILE] list
   wiseguard [--config FILE] up [--mode auto|direct|wstunnel] [--foreground] PROFILE
-  wiseguard [--config FILE] down
-  wiseguard [--config FILE] status
+  wiseguard [--config FILE] down [PROFILE]
+  wiseguard [--config FILE] status [PROFILE]
   wiseguard version`)
 }
 
@@ -109,11 +110,6 @@ func (c cli) up(ctx context.Context, args []string) error {
 	if *mode != "auto" && *mode != "direct" && *mode != "wstunnel" {
 		return fmt.Errorf("invalid mode %q", *mode)
 	}
-	if existing, err := loadState(c.config.StateFile); err == nil {
-		return fmt.Errorf("profile %s is already recorded as active (run down first)", existing.Profile)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
 	profile, path, err := c.resolveProfile(fs.Arg(0))
 	if err != nil {
 		return err
@@ -122,15 +118,21 @@ func (c cli) up(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if *mode == "direct" {
-		return c.startDirect(ctx, profile, path, *foreground)
+	var peers []wgconf.Peer
+	if *mode != "direct" {
+		peers, err = wgconf.Parse(path)
+		if err != nil {
+			return err
+		}
 	}
-	peers, err := wgconf.Parse(path)
+	portBase, err := c.reserveProfile(profile, path, *mode, len(peers))
 	if err != nil {
 		return err
 	}
-	if c.config.PortBase+len(peers)-1 > 65535 {
-		return fmt.Errorf("not enough UDP ports starting at port_base for %d peers", len(peers))
+	defer c.deleteStartingState(profile)
+
+	if *mode == "direct" {
+		return c.startDirect(ctx, profile, path, *foreground)
 	}
 	if *mode == "auto" {
 		fmt.Fprintf(c.out, "Trying direct WireGuard for %s...\n", c.config.AutoTimeout)
@@ -140,7 +142,7 @@ func (c cli) up(ctx context.Context, args []string) error {
 		}
 		if c.waitHandshake(ctx, iface, c.config.AutoTimeout) {
 			s := state{Profile: profile, ProfilePath: path, Interface: iface, Mode: "direct", StartedAt: time.Now()}
-			if err := saveState(c.config.StateFile, s); err != nil {
+			if err := c.setProfileState(s); err != nil {
 				_ = c.wgQuickDown(path)
 				return err
 			}
@@ -156,7 +158,7 @@ func (c cli) up(ctx context.Context, args []string) error {
 			return fmt.Errorf("stop direct WireGuard before fallback: %w", err)
 		}
 	}
-	return c.startTunneled(ctx, profile, path, peers, *foreground)
+	return c.startTunneled(ctx, profile, path, peers, portBase, *foreground)
 }
 
 func (c cli) startDirect(ctx context.Context, profile, path string, foreground bool) error {
@@ -165,7 +167,7 @@ func (c cli) startDirect(ctx context.Context, profile, path string, foreground b
 		return err
 	}
 	s := state{Profile: profile, ProfilePath: path, Interface: iface, Mode: "direct", StartedAt: time.Now()}
-	if err := saveState(c.config.StateFile, s); err != nil {
+	if err := c.setProfileState(s); err != nil {
 		_ = c.wgQuickDown(path)
 		return err
 	}
@@ -173,7 +175,7 @@ func (c cli) startDirect(ctx context.Context, profile, path string, foreground b
 	return c.maybeForeground(ctx, s, foreground, nil)
 }
 
-func (c cli) startTunneled(ctx context.Context, profile, path string, peers []wgconf.Peer, foreground bool) error {
+func (c cli) startTunneled(ctx context.Context, profile, path string, peers []wgconf.Peer, portBase int, foreground bool) error {
 	if c.config.WSTunnelURL == "" {
 		return fmt.Errorf("wstunnel_url (or WISEGUARD_WSTUNNEL_URL) is required")
 	}
@@ -183,7 +185,7 @@ func (c cli) startTunneled(ctx context.Context, profile, path string, peers []wg
 	}
 	var remoteTargets, localTargets []string
 	for i, peer := range peers {
-		local := fmt.Sprintf("%s:%d", c.config.BindAddress, c.config.PortBase+i)
+		local := formatDestination(c.config.BindAddress, portBase+i)
 		remote := peer.Endpoint
 		forward := fmt.Sprintf("udp://%s:%s?timeout_sec=0", local, formatDestination(peer.Host, peer.Port))
 		args = append(args, "-L", forward)
@@ -207,7 +209,7 @@ func (c cli) startTunneled(ctx context.Context, profile, path string, peers []wg
 		return err
 	}
 	for i, peer := range peers {
-		local := fmt.Sprintf("%s:%d", c.config.BindAddress, c.config.PortBase+i)
+		local := formatDestination(c.config.BindAddress, portBase+i)
 		if err := c.run(c.config.WG, "set", iface, "peer", peer.PublicKey, "endpoint", local); err != nil {
 			_ = c.wgQuickDown(path)
 			stopTunnel()
@@ -215,7 +217,7 @@ func (c cli) startTunneled(ctx context.Context, profile, path string, peers []wg
 		}
 	}
 	s := state{Profile: profile, ProfilePath: path, Interface: iface, Mode: "wstunnel", WSTunnelPID: tunnelPID, RemoteTargets: remoteTargets, LocalTargets: localTargets, StartedAt: time.Now()}
-	if err := saveState(c.config.StateFile, s); err != nil {
+	if err := c.setProfileState(s); err != nil {
 		_ = c.wgQuickDown(path)
 		stopTunnel()
 		return err
@@ -309,15 +311,29 @@ func normalizedWSTunnelEnv(environ []string) []string {
 }
 
 func (c cli) down(args []string) error {
-	if len(args) != 0 {
-		return fmt.Errorf("down takes no arguments")
+	if len(args) > 1 {
+		return fmt.Errorf("down takes at most one profile")
 	}
-	s, err := loadState(c.config.StateFile)
+	store, err := loadStateStore(c.config.StateFile)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("no active profile")
+		return fmt.Errorf("no active profiles")
 	}
 	if err != nil {
 		return err
+	}
+	name := ""
+	if len(args) == 1 {
+		name = strings.TrimSuffix(args[0], ".conf")
+	} else {
+		names := stateNames(store)
+		if len(names) != 1 {
+			return fmt.Errorf("multiple profiles are active; specify one: %s", strings.Join(names, ", "))
+		}
+		name = names[0]
+	}
+	s, ok := store.Tunnels[name]
+	if !ok {
+		return fmt.Errorf("profile %q is not active", name)
 	}
 	return c.stop(s)
 }
@@ -336,19 +352,19 @@ func (c cli) stop(s state) error {
 		}
 	}
 	if len(failures) == 0 {
-		if err := removeState(c.config.StateFile); err != nil {
+		if err := c.deleteProfileState(s.Profile); err != nil {
 			return err
 		}
-		fmt.Fprintln(c.out, "Disconnected.")
+		fmt.Fprintf(c.out, "Disconnected %s.\n", s.Profile)
 	}
 	return errors.Join(failures...)
 }
 
 func (c cli) status(args []string) error {
-	if len(args) != 0 {
-		return fmt.Errorf("status takes no arguments")
+	if len(args) > 1 {
+		return fmt.Errorf("status takes at most one profile")
 	}
-	s, err := loadState(c.config.StateFile)
+	store, err := loadStateStore(c.config.StateFile)
 	if errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(c.out, "Status: disconnected")
 		return nil
@@ -356,10 +372,34 @@ func (c cli) status(args []string) error {
 	if err != nil {
 		return err
 	}
+	names := stateNames(store)
+	if len(args) == 1 {
+		name := strings.TrimSuffix(args[0], ".conf")
+		if _, ok := store.Tunnels[name]; !ok {
+			return fmt.Errorf("profile %q is not active", name)
+		}
+		names = []string{name}
+	}
 	interfaces, wgErr := c.interfaces()
+	for i, name := range names {
+		if i > 0 {
+			fmt.Fprintln(c.out)
+		}
+		c.printState(store.Tunnels[name], interfaces)
+	}
+	return wgErr
+}
+
+func (c cli) printState(s state, interfaces []string) {
+	starting := strings.HasPrefix(s.Mode, "starting:")
 	active := contains(interfaces, s.Interface)
-	fmt.Fprintf(c.out, "Status:         %s\n", map[bool]string{true: "connected", false: "stale"}[active])
-	fmt.Fprintf(c.out, "Profile:        %s\nInterface:      %s\nTransport:      %s\nStarted:        %s\n", s.Profile, s.Interface, s.Mode, s.StartedAt.Local().Format(time.RFC3339))
+	status := map[bool]string{true: "connected", false: "stale"}[active]
+	if starting {
+		status = "starting"
+	}
+	mode := strings.TrimPrefix(s.Mode, "starting:")
+	fmt.Fprintf(c.out, "Status:         %s\n", status)
+	fmt.Fprintf(c.out, "Profile:        %s\nInterface:      %s\nTransport:      %s\nStarted:        %s\n", s.Profile, s.Interface, mode, s.StartedAt.Local().Format(time.RFC3339))
 	forwardCount := len(s.RemoteTargets)
 	if len(s.LocalTargets) < forwardCount {
 		forwardCount = len(s.LocalTargets)
@@ -370,16 +410,98 @@ func (c cli) status(args []string) error {
 	if s.WSTunnelPID != 0 {
 		fmt.Fprintf(c.out, "wstunnel PID:   %d (%s)\n", s.WSTunnelPID, map[bool]string{true: "running", false: "not running"}[processRunning(s.WSTunnelPID)])
 	}
-	if wgErr != nil {
-		return wgErr
-	}
 	if active {
 		output, err := exec.Command(c.config.WG, "show", s.Interface, "latest-handshakes").Output()
 		if err == nil {
 			fmt.Fprintf(c.out, "Handshake:      %s\n", describeHandshake(string(output)))
 		}
 	}
-	return nil
+}
+
+func (c cli) reserveProfile(profile, path, mode string, peerCount int) (int, error) {
+	portBase := 0
+	err := withLockedState(c.config.StateFile, func(store *stateStore) error {
+		if existing, ok := store.Tunnels[profile]; ok {
+			return fmt.Errorf("profile %s is already recorded as %s", profile, strings.TrimPrefix(existing.Mode, "starting:"))
+		}
+		if peerCount > 0 {
+			var err error
+			portBase, err = c.availablePortBase(*store, peerCount)
+			if err != nil {
+				return err
+			}
+		}
+		reservedTargets := make([]string, 0, peerCount)
+		for i := 0; i < peerCount; i++ {
+			reservedTargets = append(reservedTargets, formatDestination(c.config.BindAddress, portBase+i))
+		}
+		store.Tunnels[profile] = state{Profile: profile, ProfilePath: path, Mode: "starting:" + mode, LocalTargets: reservedTargets, StartedAt: time.Now()}
+		return nil
+	})
+	return portBase, err
+}
+
+func (c cli) availablePortBase(store stateStore, count int) (int, error) {
+	used := make(map[int]bool)
+	for _, s := range store.Tunnels {
+		for _, target := range s.LocalTargets {
+			_, portText, err := net.SplitHostPort(target)
+			if err != nil {
+				continue
+			}
+			if port, err := strconv.Atoi(portText); err == nil {
+				used[port] = true
+			}
+		}
+	}
+	for base := c.config.PortBase; base+count-1 <= 65535; base++ {
+		available := true
+		for port := base; port < base+count; port++ {
+			if used[port] || !udpPortAvailable(c.config.BindAddress, port) {
+				available = false
+				break
+			}
+		}
+		if available {
+			return base, nil
+		}
+	}
+	return 0, fmt.Errorf("no block of %d UDP ports is available from port_base %d", count, c.config.PortBase)
+}
+
+var udpPortAvailable = func(address string, port int) bool {
+	listener, err := net.ListenPacket("udp", formatDestination(address, port))
+	if err != nil {
+		return false
+	}
+	_ = listener.Close()
+	return true
+}
+
+func (c cli) setProfileState(s state) error {
+	return withLockedState(c.config.StateFile, func(store *stateStore) error {
+		if _, ok := store.Tunnels[s.Profile]; !ok {
+			return fmt.Errorf("startup of profile %s was cancelled", s.Profile)
+		}
+		store.Tunnels[s.Profile] = s
+		return nil
+	})
+}
+
+func (c cli) deleteProfileState(profile string) error {
+	return withLockedState(c.config.StateFile, func(store *stateStore) error {
+		delete(store.Tunnels, profile)
+		return nil
+	})
+}
+
+func (c cli) deleteStartingState(profile string) {
+	_ = withLockedState(c.config.StateFile, func(store *stateStore) error {
+		if s, ok := store.Tunnels[profile]; ok && strings.HasPrefix(s.Mode, "starting:") {
+			delete(store.Tunnels, profile)
+		}
+		return nil
+	})
 }
 
 func (c cli) resolveProfile(name string) (string, string, error) {

@@ -69,12 +69,21 @@ When invoked through `sudo`, wiseguard uses the invoking user's home directory
 ```sh
 wiseguard list
 sudo wiseguard up office
+sudo wiseguard up lab
 sudo wiseguard up --mode direct office
 sudo wiseguard up --mode wstunnel office
 sudo wiseguard up --foreground --mode wstunnel office
 sudo wiseguard status
-sudo wiseguard down
+sudo wiseguard status office
+sudo wiseguard down office
+sudo wiseguard down lab
 ```
+
+Multiple profiles can be active at the same time. Each `up` operation only
+affects the selected profile, while `down PROFILE` disconnects that profile
+without changing the others. `status` lists every recorded profile and
+`status PROFILE` selects one. For backward compatibility, `down` without a
+profile is accepted when exactly one profile is active.
 
 `auto` is the default mode. It brings WireGuard up directly and waits for a
 handshake. If none is observed within `auto_timeout`, it brings the interface
@@ -85,6 +94,8 @@ available; use `--mode direct` when that distinction matters.
 For every peer that has an `Endpoint`, tunneled mode creates a separate local
 UDP forward starting at `port_base`, starts the original profile using
 `wg-quick`, and then changes that peer's live endpoint to its local forward.
+When multiple tunneled profiles are active, wiseguard allocates subsequent
+available UDP ports so their local listeners do not collide.
 Private keys and profile contents are never copied into the state file.
 TLS certificate verification is enabled by default; only set
 `tls_verify = false` for a deliberately self-signed deployment.
